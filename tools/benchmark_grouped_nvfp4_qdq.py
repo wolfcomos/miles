@@ -309,7 +309,12 @@ def _build_grouped_linear(x: torch.Tensor, packed: bool) -> GroupedLinear:
 def _measure_adapter(x: torch.Tensor, packed: bool, output_bytes: int, args: argparse.Namespace) -> dict[str, Any]:
     module = _build_grouped_linear(x, packed)
     weight_tensors = module._get_weight_tensors()
-    fn = functools.partial(maybe_fake_quantize_nvfp4_weight_tensors, weight_tensors)
+    fn = functools.partial(
+        maybe_fake_quantize_nvfp4_weight_tensors,
+        weight_tensors,
+        fuse_wgrad_accumulation=module.fuse_wgrad_accumulation,
+        delay_wgrad_compute=False,
+    )
     result = _measure(fn, output_bytes, args, graph=args.graph_adapter)
     result["launches"]["weight_tensors"] = len(weight_tensors)
     del fn, weight_tensors, module

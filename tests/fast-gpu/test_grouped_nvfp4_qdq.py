@@ -464,7 +464,9 @@ def test_nvfp4_fake_qat_adapter_routes_packed_and_discrete_weights(
     assert nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(discrete) is discrete
 
     monkeypatch.setenv(nvfp4_qat.NVFP4_FAKE_QAT_FLAG, "1")
-    actual_packed = nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(packed)
+    actual_packed = nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(
+        packed, fuse_wgrad_accumulation=False, delay_wgrad_compute=False
+    )
     actual_discrete = nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(discrete)
 
     assert (
@@ -478,7 +480,13 @@ def test_nvfp4_fake_qat_adapter_routes_packed_and_discrete_weights(
         assert not isinstance(weight, GroupedTensor) and weight.grad_fn is not None
         _assert_bitwise(weight, expected[g])
 
-    for kwargs in ({"fuse_wgrad_accumulation": True}, {"delay_wgrad_compute": True}):
+    # A caller that does not state the module flags (the pre-companion Megatron hook) must fail closed.
+    with pytest.raises(NotImplementedError, match="needs the caller to pass"):
+        nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(packed)
+    for kwargs in (
+        {"fuse_wgrad_accumulation": True, "delay_wgrad_compute": False},
+        {"fuse_wgrad_accumulation": False, "delay_wgrad_compute": True},
+    ):
         with pytest.raises(NotImplementedError, match="gradient_accumulation_fusion=False"):
             nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(packed, **kwargs)
 
@@ -489,7 +497,7 @@ class _FakeQATGroupedLinear(GroupedLinear):
     def _get_weight_tensors(self):
         weight_tensors = super()._get_weight_tensors()
         return nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(
-            weight_tensors, fuse_wgrad_accumulation=self.fuse_wgrad_accumulation
+            weight_tensors, fuse_wgrad_accumulation=self.fuse_wgrad_accumulation, delay_wgrad_compute=False
         )
 
 
