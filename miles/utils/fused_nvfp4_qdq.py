@@ -1000,8 +1000,8 @@ def _dequantize_pack_pair(packed_pair: Uint32, final_scale: Float32, is_bfloat16
 
 @cute.jit
 def _dequantize_store(
-    output: cute.Tensor,
-    offset: Int32,
+    ptr0: Int64,
+    ptr1: Int64,
     lo: Uint32,
     hi: Uint32,
     scale: Uint32,
@@ -1014,14 +1014,12 @@ def _dequantize_store(
     final_scale = _fmul_rn(scale_f32, global_amax)
     final_scale = _fmul_rn(final_scale, Float32(1.0 / float(6 * e4m3_max)))
 
-    ptr0 = _get_ptr(output, offset)
     out0 = _dequantize_pack_pair(lo, final_scale, is_bfloat16)
     out1 = _dequantize_pack_pair(lo >> Uint32(8), final_scale, is_bfloat16)
     out2 = _dequantize_pack_pair(lo >> Uint32(16), final_scale, is_bfloat16)
     out3 = _dequantize_pack_pair(lo >> Uint32(24), final_scale, is_bfloat16)
     _store_v4_u32(ptr0, out0, out1, out2, out3)
 
-    ptr1 = _get_ptr(output, offset + Int32(8))
     out4 = _dequantize_pack_pair(hi, final_scale, is_bfloat16)
     out5 = _dequantize_pack_pair(hi >> Uint32(8), final_scale, is_bfloat16)
     out6 = _dequantize_pack_pair(hi >> Uint32(16), final_scale, is_bfloat16)
@@ -1100,7 +1098,16 @@ class _NVFP4QDQKernel:
                     words, block_amax, global_encode_scale, global_decode_scale, self.is_bfloat16
                 )
 
-            _dequantize_store(output_tensor, offset, lo, hi, scale, amax, self.config.e4m3_max, self.is_bfloat16)
+            _dequantize_store(
+                _get_ptr(output_tensor, offset),
+                _get_ptr(output_tensor, offset + Int32(8)),
+                lo,
+                hi,
+                scale,
+                amax,
+                self.config.e4m3_max,
+                self.is_bfloat16,
+            )
             block = block + stride
 
 
