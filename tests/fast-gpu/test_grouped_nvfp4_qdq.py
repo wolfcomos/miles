@@ -356,6 +356,13 @@ def _oversized_expert_input() -> torch.Tensor:
             None, lambda x: torch.ones((2,), dtype=torch.bfloat16, device="cuda"), TypeError, "FP32", id="amax-dtype"
         ),
         pytest.param(None, lambda x: torch.ones((2,), dtype=torch.float32), ValueError, "CUDA device", id="amax-cpu"),
+        pytest.param(
+            None,
+            lambda x: torch.ones((2 * x.shape[0],), dtype=torch.float32, device="cuda")[::2],
+            ValueError,
+            "contiguous",
+            id="amax-strided",
+        ),
     ],
 )
 def test_fused_grouped_nvfp4_qdq_rejects_invalid_inputs(

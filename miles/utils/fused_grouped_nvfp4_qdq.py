@@ -182,6 +182,8 @@ def _validate_grouped_input(x: torch.Tensor, amax: torch.Tensor) -> tuple[int, t
         raise TypeError(
             f"The per-group amax must be an FP32 tensor of shape ({num_groups},), got {amax.dtype} {tuple(amax.shape)}."
         )
+    if not amax.is_contiguous():
+        raise ValueError("The per-group amax must be a contiguous FP32 tensor.")
     device_index = x.device.index
     if device_index is None:
         raise RuntimeError("CUDA tensor does not have a concrete device index.")
