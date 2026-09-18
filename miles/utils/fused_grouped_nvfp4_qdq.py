@@ -22,8 +22,6 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
-from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
-
 from miles.utils.fused_nvfp4_qdq import (
     _4OVER6_BLOCKS_PER_SM,
     _4OVER6_THREADS,
@@ -45,6 +43,7 @@ from miles.utils.fused_nvfp4_qdq import (
     _standard_quantize,
     current_nvfp4_qdq_config,
 )
+from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 
 # Each 1x16 block is 32 bytes for both BF16 and FP16.
 _BLOCK_BYTES = 2 * _FP4_BLOCK_SIZE
@@ -174,11 +173,15 @@ def _validate_grouped_input(x: torch.Tensor, amax: torch.Tensor) -> tuple[int, t
     if cols % _FP4_BLOCK_SIZE != 0:
         raise ValueError(f"Grouped fused NVFP4 QDQ requires K divisible by {_FP4_BLOCK_SIZE}, got {cols}.")
     if rows * cols > _INT32_MAX:
-        raise ValueError(f"Grouped fused NVFP4 QDQ supports at most {_INT32_MAX} elements per group, got {rows * cols}.")
+        raise ValueError(
+            f"Grouped fused NVFP4 QDQ supports at most {_INT32_MAX} elements per group, got {rows * cols}."
+        )
     if not amax.is_cuda or amax.device != x.device:
         raise ValueError("The FP32 per-group amax must be on the input tensor's CUDA device.")
     if amax.dtype != torch.float32 or amax.shape != (num_groups,):
-        raise TypeError(f"The per-group amax must be an FP32 tensor of shape ({num_groups},), got {amax.dtype} {tuple(amax.shape)}.")
+        raise TypeError(
+            f"The per-group amax must be an FP32 tensor of shape ({num_groups},), got {amax.dtype} {tuple(amax.shape)}."
+        )
     device_index = x.device.index
     if device_index is None:
         raise RuntimeError("CUDA tensor does not have a concrete device index.")
@@ -266,9 +269,7 @@ def compute_grouped_nvfp4_amax(x: torch.Tensor) -> torch.Tensor:
     return torch.linalg.vector_norm(x.detach().reshape(x.shape[0], -1), ord=float("inf"), dim=1, dtype=torch.float32)
 
 
-def fused_grouped_nvfp4_qdq(
-    x: torch.Tensor, amax: torch.Tensor, config: NVFP4QDQConfig | None = None
-) -> torch.Tensor:
+def fused_grouped_nvfp4_qdq(x: torch.Tensor, amax: torch.Tensor, config: NVFP4QDQConfig | None = None) -> torch.Tensor:
     """Run one register-resident NVFP4 QDQ launch over all groups and return a detached tensor."""
     if config is None:
         config = current_nvfp4_qdq_config()
@@ -303,7 +304,9 @@ def _packed_weight_shape(weight: GroupedTensor) -> tuple[int, int, int]:
     return num_groups, rows, cols
 
 
-def fused_grouped_nvfp4_qdq_packed_weight(weight: GroupedTensor, config: NVFP4QDQConfig | None = None) -> GroupedTensor:
+def fused_grouped_nvfp4_qdq_packed_weight(
+    weight: GroupedTensor, config: NVFP4QDQConfig | None = None
+) -> GroupedTensor:
     """Fake-quantize the current payload of a packed grouped weight into a new GroupedTensor."""
     num_groups, rows, cols = _packed_weight_shape(weight)
     # Read the live payload every call: optimizer steps, DDP rebinding, and checkpoint
@@ -311,7 +314,11 @@ def fused_grouped_nvfp4_qdq_packed_weight(weight: GroupedTensor, config: NVFP4QD
     x = weight.rowwise_data.view(num_groups, rows, cols)
     output = fused_grouped_nvfp4_qdq(x, compute_grouped_nvfp4_amax(x), config)
     return GroupedTensor.make_grouped_tensor_from_rowwise_data(
-        num_tensors=num_groups, tensor_shape=(rows, cols), rowwise_data=output.view(-1), dtype=output.dtype, internal=False
+        num_tensors=num_groups,
+        tensor_shape=(rows, cols),
+        rowwise_data=output.view(-1),
+        dtype=output.dtype,
+        internal=False,
     )
 
 
