@@ -12,8 +12,9 @@ Adapter paths (complete ``maybe_fake_quantize_nvfp4_weight_tensors`` latency on 
 
 Every path reports eager and CUDA-graph replay latency (CUDA events, median/p10/p90
 microseconds), CUDA launch counts from torch.profiler, and the peak allocation delta
-of one call. Grouped launch counts are checked to stay constant across G. Run inside
-the Miles container on one SM10x GPU, e.g.::
+of one call. Grouped QDQ is checked to be one launch at every G and grouped amax+QDQ to
+stay within a G-independent launch bound. Run inside the Miles container on one SM10x
+GPU, e.g.::
 
     NVTE_USE_FAST_MATH=0 NVTE_GROUPED_LINEAR_SINGLE_PARAM=1 \\
         python tools/benchmark_grouped_nvfp4_qdq.py --out /work/results/bench
@@ -59,6 +60,9 @@ _SPEEDUPS = {
     "speedup_te_vs_grouped": ("te_per_expert_qdq", "grouped_amax_qdq"),
     "speedup_adapter": ("adapter_discrete", "adapter_packed"),
 }
+# One grouped QDQ kernel plus torch's vector_norm reduction, which splits into two
+# 32-bit-indexable reduce kernels (each with a semaphore memset) above a 2 GiB payload.
+_MAX_GROUPED_AMAX_QDQ_LAUNCHES = 5
 # config name -> (config, TE environment that makes current_nvfp4_qdq_config() and TE's
 # 4over6 candidate-error math agree with it; None unsets the variable).
 _CONFIGS: dict[str, tuple[NVFP4QDQConfig, dict[str, str | None]]] = {
@@ -358,7 +362,7 @@ def _run_case(
 
 
 def _launch_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Grouped launch counts must not depend on G; grouped QDQ must be exactly one kernel."""
+    """Grouped QDQ must be one kernel at every G; grouped amax+QDQ must stay within a G-independent bound."""
     groups: dict[tuple, dict[str, set[int]]] = {}
     for row in rows:
         if "grouped_qdq" not in row:
@@ -374,7 +378,8 @@ def _launch_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "case": key,
                 "grouped_qdq_launches": sorted(counts["grouped_qdq"]),
                 "grouped_amax_qdq_launches": sorted(counts["grouped_amax_qdq"]),
-                "passed": counts["grouped_qdq"] == {1} and len(counts["grouped_amax_qdq"]) == 1,
+                "passed": counts["grouped_qdq"] == {1}
+                and max(counts["grouped_amax_qdq"]) <= _MAX_GROUPED_AMAX_QDQ_LAUNCHES,
             }
         )
     return checks
@@ -501,7 +506,7 @@ def main() -> None:
     for check in results["checks"]:
         print(f"launch check {'PASS' if check['passed'] else 'FAIL'}: {check}", flush=True)
     if not all(check["passed"] for check in results["checks"]):
-        raise SystemExit("grouped launch counts are not G-independent or grouped QDQ is not a single launch")
+        raise SystemExit("grouped QDQ is not a single launch or grouped amax+QDQ exceeds its G-independent launch bound")
 
 
 if __name__ == "__main__":
