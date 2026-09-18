@@ -270,7 +270,7 @@ def _cleanup():
     torch.cuda.empty_cache()
 
 
-def _make_args(*, packed, ep, num_experts, hidden, moe_ffn, seq, mbs, ckpt_dir=None):
+def _make_args(*, packed, ep, num_experts, hidden, moe_ffn, seq, mbs, ckpt_dir=None, load=True):
     sys.argv = ["_grouped_nvfp4_qdq_megatron_worker.py"]
     args = parse_args()
     args.num_layers = 1
@@ -317,7 +317,7 @@ def _make_args(*, packed, ep, num_experts, hidden, moe_ffn, seq, mbs, ckpt_dir=N
     args.moe_mlp_glu_interleave_size = 32
     if ckpt_dir is not None:
         args.save = ckpt_dir
-        args.load = ckpt_dir
+        args.load = ckpt_dir if load else None  # setup_model_and_optimizer auto-loads from args.load
         args.save_interval = 1000
         args.no_save_optim = True
         args.no_load_optim = True
@@ -377,7 +377,7 @@ def _fill_model(model, num_experts, hidden, force_router):
 
 
 def _build_gpt(
-    *, packed, ep, num_experts=4, hidden=256, moe_ffn=256, seq=128, mbs=2, ckpt_dir=None, force_router=True
+    *, packed, ep, num_experts=4, hidden=256, moe_ffn=256, seq=128, mbs=2, ckpt_dir=None, load=True, force_router=True
 ):
     """Fresh (model, optimizer, scheduler, experts) with deterministic expert weights and a forced router."""
     _cleanup()
@@ -393,6 +393,7 @@ def _build_gpt(
         seq=seq,
         mbs=mbs,
         ckpt_dir=ckpt_dir,
+        load=load,
     )
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=ep)
     torch.manual_seed(_SEED)
@@ -621,9 +622,10 @@ def case_checkpoint(opts):
     cont_qdq = capture.calls[0][2]
     capture.remove()
 
-    model, optimizer, scheduler, mlp, G = _build_gpt(packed=True, ep=1, ckpt_dir=ckpt_dir)
+    model, optimizer, scheduler, mlp, G = _build_gpt(packed=True, ep=1, ckpt_dir=ckpt_dir, load=False)
     fc1 = mlp.linear_fc1
     assert not torch.equal(fc1.weight.rowwise_data, saved_payload), "fresh model already equals the checkpoint"
+    get_args().load = ckpt_dir
     iteration, _ = load_checkpoint(model, optimizer, scheduler, strict=True)
     assert iteration == 2
     assert torch.equal(fc1.weight.rowwise_data, saved_payload), "reloaded packed payload differs bitwise"
@@ -640,7 +642,7 @@ def case_checkpoint(opts):
     )
 
     _set_fake_qat(False)
-    model, *_ = _build_gpt(packed=True, ep=1, ckpt_dir=ckpt_dir)
+    model, *_ = _build_gpt(packed=True, ep=1, ckpt_dir=ckpt_dir, load=False)
     assert sorted(model[0].sharded_state_dict().keys()) == keys_qat, "fake QAT changed checkpoint keys"
 
 
