@@ -15,7 +15,6 @@ output is bit-identical to ``fused_nvfp4_qdq(x[g], amax[g])``.
 
 from __future__ import annotations
 
-import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +22,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
+from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 
 from miles.utils.fused_nvfp4_qdq import (
     _4OVER6_BLOCKS_PER_SM,
@@ -280,7 +280,67 @@ def fused_grouped_nvfp4_qdq(
         return _launch_fused_grouped_nvfp4_qdq(x, amax, config, capability, multiprocessors)
 
 
+def _packed_weight_shape(weight: GroupedTensor) -> tuple[int, int, int]:
+    """Validate a BF16/FP16 single grouped weight and return its ``[G, N, K]`` payload shape."""
+    if not isinstance(weight, GroupedTensor):
+        raise TypeError(f"Packed NVFP4 fake QAT requires a TE GroupedTensor, got {type(weight).__name__}.")
+    if weight.quantizer is not None:
+        raise ValueError("Packed NVFP4 fake QAT requires a high-precision grouped weight (quantizer=None).")
+    if not weight.all_same_shape() or not weight.tensor_shapes or len(weight.tensor_shapes[0]) != 2:
+        raise ValueError("Packed NVFP4 fake QAT requires uniform rank-2 expert weights.")
+    payload = weight.rowwise_data
+    if payload is None or not payload.is_contiguous():
+        raise ValueError("Packed NVFP4 fake QAT requires a contiguous rowwise payload.")
+    if payload.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"Packed NVFP4 fake QAT supports BF16 and FP16 payloads, got {payload.dtype}.")
+    num_groups = weight.num_tensors
+    rows, cols = weight.tensor_shapes[0]
+    if payload.numel() != num_groups * rows * cols or tuple(weight.shape) != (num_groups, rows, cols):
+        raise ValueError(
+            f"Packed NVFP4 fake QAT payload/shape mismatch: payload {payload.numel()} elements, "
+            f"wrapper shape {tuple(weight.shape)}, members {num_groups} x {(rows, cols)}."
+        )
+    return num_groups, rows, cols
+
+
+def fused_grouped_nvfp4_qdq_packed_weight(weight: GroupedTensor, config: NVFP4QDQConfig | None = None) -> GroupedTensor:
+    """Fake-quantize the current payload of a packed grouped weight into a new GroupedTensor."""
+    num_groups, rows, cols = _packed_weight_shape(weight)
+    # Read the live payload every call: optimizer steps, DDP rebinding, and checkpoint
+    # loads all write through weight.rowwise_data.
+    x = weight.rowwise_data.view(num_groups, rows, cols)
+    output = fused_grouped_nvfp4_qdq(x, compute_grouped_nvfp4_amax(x), config)
+    return GroupedTensor.make_grouped_tensor_from_rowwise_data(
+        num_tensors=num_groups, tensor_shape=(rows, cols), rowwise_data=output.view(-1), dtype=output.dtype, internal=False
+    )
+
+
+class _FusedGroupedNVFP4QDQSTE(torch.autograd.Function):
+    """Identity backward around grouped QDQ of a registered single grouped weight."""
+
+    @staticmethod
+    def forward(ctx: Any, weight: GroupedTensor, config: NVFP4QDQConfig) -> GroupedTensor:
+        """Return an autograd-connected fake-quantized GroupedTensor over a fresh payload."""
+        del ctx
+        return fused_grouped_nvfp4_qdq_packed_weight(weight, config)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Propagate the packed weight gradient to the original grouped parameter unchanged."""
+        del ctx
+        return grad_output, None
+
+
+def fake_grouped_nvfp4_quantization_ste(weight: GroupedTensor, config: NVFP4QDQConfig | None = None) -> GroupedTensor:
+    """Apply grouped QDQ to a packed grouped weight with a straight-through estimator."""
+    if config is None:
+        config = current_nvfp4_qdq_config()
+    return _FusedGroupedNVFP4QDQSTE.apply(weight, config)
+
+
 __all__ = [
     "compute_grouped_nvfp4_amax",
+    "fake_grouped_nvfp4_quantization_ste",
     "fused_grouped_nvfp4_qdq",
+    "fused_grouped_nvfp4_qdq_packed_weight",
 ]
