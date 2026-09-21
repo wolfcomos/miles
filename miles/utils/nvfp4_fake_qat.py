@@ -9,15 +9,6 @@ import torch
 NVFP4_FAKE_QAT_FLAG = "OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG"
 
 
-def _is_packed_grouped_weight(weight_tensors: list[torch.Tensor]) -> bool:
-    """True for TE's single-grouped-weight layout: one GroupedTensor packing every local expert."""
-    if len(weight_tensors) != 1:
-        return False
-    from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
-
-    return isinstance(weight_tensors[0], GroupedTensor)
-
-
 def maybe_fake_quantize_nvfp4_weight_tensors(
     weight_tensors: list[torch.Tensor],
     *,
@@ -38,8 +29,10 @@ def maybe_fake_quantize_nvfp4_weight_tensors(
     # Keep CuTe DSL optional for every process that does not enable this path.
     from miles.utils.fused_nvfp4_qdq import current_nvfp4_qdq_config, fake_nvfp4_quantization_ste
 
+    from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+
     qdq_config = current_nvfp4_qdq_config()
-    if _is_packed_grouped_weight(weight_tensors):
+    if isinstance(weight_tensors[0], GroupedTensor):
         if fuse_wgrad_accumulation is None or delay_wgrad_compute is None:
             raise NotImplementedError(
                 "Packed NVFP4 fake QAT needs the caller to pass fuse_wgrad_accumulation and "
