@@ -11,15 +11,39 @@ NVFP4_FAKE_QAT_FLAG = "OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG"
 
 def maybe_fake_quantize_nvfp4_weight_tensors(
     weight_tensors: list[torch.Tensor],
+    *,
+    fuse_wgrad_accumulation: bool | None = None,
+    delay_wgrad_compute: bool | None = None,
 ) -> list[torch.Tensor]:
-    """Apply env-gated fused NVFP4 fake QAT to discrete TE grouped-linear weights."""
+    """Apply env-gated fused NVFP4 fake QAT to TE grouped-linear weights.
+
+    Discrete per-expert weights are fake-quantized one tensor at a time. A single
+    packed grouped weight is fake-quantized by one grouped launch and returned as a
+    one-element list holding an autograd-connected GroupedTensor; that path needs
+    the caller to state the module's ``fuse_wgrad_accumulation`` and
+    ``delay_wgrad_compute`` flags, because both must be off.
+    """
     if os.getenv(NVFP4_FAKE_QAT_FLAG, "0") != "1":
         return weight_tensors
 
     # Keep CuTe DSL optional for every process that does not enable this path.
     from miles.utils.fused_nvfp4_qdq import current_nvfp4_qdq_config, fake_nvfp4_quantization_ste
 
+    from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+
     qdq_config = current_nvfp4_qdq_config()
+    if isinstance(weight_tensors[0], GroupedTensor):
+        if fuse_wgrad_accumulation is None or delay_wgrad_compute is None:
+            raise NotImplementedError(
+                "Packed NVFP4 fake QAT needs the caller to pass fuse_wgrad_accumulation and "
+                "delay_wgrad_compute (see TEGroupedLinear._get_weight_tensors in the miles Megatron fork)."
+            )
+        if fuse_wgrad_accumulation or delay_wgrad_compute:
+            raise NotImplementedError(
+                "Packed NVFP4 fake QAT requires gradient_accumulation_fusion=False and "
+                "delay_wgrad_compute=False: TE writes fused/delayed weight gradients onto the "
+                "weight object it receives, which would be the fake-quantized copy."
+            )
     return [fake_nvfp4_quantization_ste(weight, qdq_config) for weight in weight_tensors]
 
 

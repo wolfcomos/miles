@@ -219,6 +219,7 @@
       "pages": [
        "advanced/low-precision",
        "advanced/int4-qat",
+       "advanced/nvfp4-fake-qat",
        "advanced/speculative-decoding",
        "advanced/lora",
        "advanced/on-policy-distillation"

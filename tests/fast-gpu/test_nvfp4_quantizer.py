@@ -23,6 +23,7 @@ from tools.convert_hf_to_nvfp4 import quantize_nvfp4 as tool_quantize_nvfp4
 from tools.convert_hf_to_nvfp4 import should_quantize as tool_should_quantize_nvfp4
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformer_engine.pytorch.custom_recipes.quantization_ref_nvfp4 import NVFP4QuantizerRef
+from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 
 import miles.utils.nvfp4_fake_qat as nvfp4_qat
 from miles.backends.megatron_utils.megatron_to_hf.processors.quantizer_nvfp4 import (
@@ -36,6 +37,7 @@ from miles.utils.fused_nvfp4_qdq import (
     current_nvfp4_qdq_config,
     fake_nvfp4_quantization_ste,
     fused_nvfp4_qdq,
+    fused_nvfp4_qdq_packed_weight,
 )
 from miles.utils.nvfp4 import (
     NVFP4_GROUP_SIZE,
@@ -535,6 +537,15 @@ def _make_qdq_input(shape: tuple[int, int], dtype: torch.dtype, init_data: str) 
     raise ValueError(f"Unknown init_data: {init_data}")
 
 
+def _make_grouped_qdq_input(
+    shape: tuple[int, int], dtype: torch.dtype, init_data: str, num_groups: int
+) -> torch.Tensor:
+    """Stack G experts of one data pattern at distinct magnitudes and row orders: a shared amax or a wrong expert
+    base changes bits, while power-of-two scaling keeps signed zeros and finfo maxes exact."""
+    x = _make_qdq_input(shape, dtype, init_data)
+    return torch.stack([x.roll(g, dims=0) * 2.0**-g for g in range(num_groups)])
+
+
 def _make_te_qdq_quantizer(config: NVFP4QDQConfig):
     return te.NVFP4Quantizer(
         rowwise=True,
@@ -571,6 +582,7 @@ def _te_qdq_reference(x: torch.Tensor, config: NVFP4QDQConfig) -> tuple[torch.Te
 @pytest.mark.parametrize("shape", NVFP4_QDQ_SHAPES, ids=lambda shape: f"{shape[0]}x{shape[1]}")
 @pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
 @pytest.mark.parametrize("config", NVFP4_QDQ_CONFIGS)
+@pytest.mark.parametrize("num_groups", [1, 3, 8], ids=lambda num_groups: f"{num_groups}g")
 @torch.inference_mode()
 def test_fused_nvfp4_qdq_is_bit_exact_with_te(
     monkeypatch: pytest.MonkeyPatch,
@@ -578,23 +590,75 @@ def test_fused_nvfp4_qdq_is_bit_exact_with_te(
     shape: tuple[int, int],
     init_data: str,
     config: NVFP4QDQConfig,
+    num_groups: int,
 ) -> None:
-    """Cover BF16/FP16 x shapes x data patterns x the full supported feature matrix."""
+    """Cover BF16/FP16 x shapes x data patterns x the full supported feature matrix, per tensor and per expert."""
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
     monkeypatch.setenv("NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH", "1" if config.error_use_fast_math else "0")
-    x = _make_qdq_input(shape, dtype, init_data)
-    amax = compute_nvfp4_amax(x)
-    expected, te_amax = _te_qdq_reference(x, config)
-    actual = fused_nvfp4_qdq(x, amax, config)
+    experts = _make_grouped_qdq_input(shape, dtype, init_data, num_groups)
+    grouped_amax = compute_nvfp4_amax(experts)
+    grouped_actual = fused_nvfp4_qdq(experts, grouped_amax, config)
+    assert grouped_amax.shape == (num_groups,) and grouped_actual.shape == experts.shape
 
-    assert torch.equal(amax.reshape(1).view(torch.int32), te_amax.view(torch.int32))
-    # Integer views distinguish signed zero; tolerance-zero floating comparison does not.
-    actual_bits = actual.view(torch.uint16)
-    expected_bits = expected.view(torch.uint16)
-    assert torch.equal(
-        actual_bits, expected_bits
-    ), f"bit mismatch count: {torch.count_nonzero(actual_bits != expected_bits).item()}"
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    for x, expert_amax, expert_actual in zip(experts, grouped_amax, grouped_actual, strict=True):
+        amax = compute_nvfp4_amax(x)
+        expected, te_amax = _te_qdq_reference(x, config)
+        actual = fused_nvfp4_qdq(x, amax, config)
+
+        assert torch.equal(amax.reshape(1).view(torch.int32), te_amax.view(torch.int32))
+        assert torch.equal(expert_amax, amax)
+        # Integer views distinguish signed zero; tolerance-zero floating comparison does not.
+        actual_bits = actual.view(torch.uint16)
+        expected_bits = expected.view(torch.uint16)
+        assert torch.equal(
+            actual_bits, expected_bits
+        ), f"bit mismatch count: {torch.count_nonzero(actual_bits != expected_bits).item()}"
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+        # Expert g of the one grouped launch is bit-identical to the rank-2 call on x[g], amax[g].
+        assert torch.equal(expert_actual.view(torch.uint16), actual_bits)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
+def test_compute_nvfp4_amax_matches_stacked_per_expert_amax(dtype: torch.dtype, init_data: str) -> None:
+    x = _make_grouped_qdq_input((33, 48), dtype, init_data, 8).requires_grad_(True)
+    actual = compute_nvfp4_amax(x)
+    expected = torch.stack([compute_nvfp4_amax(expert) for expert in x])
+
+    assert actual.dtype == torch.float32 and actual.device == x.device and actual.shape == (8,)
+    assert not actual.requires_grad
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("config", NVFP4_QDQ_CONFIGS)
+@torch.inference_mode()
+def test_fused_nvfp4_qdq_uses_per_expert_amax_and_expert_order(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, config: NVFP4QDQConfig
+) -> None:
+    monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH", "1" if config.error_use_fast_math else "0")
+    torch.manual_seed(7)
+    num_groups, m, n = 5, 24, 128
+    magnitudes = torch.tensor([1e-3, 0.0, 1e3, 1.0, 30.0], device="cuda")
+    x = (torch.randn((num_groups, m, n), device="cuda") * magnitudes.view(num_groups, 1, 1)).to(dtype=dtype)
+    x[1] = -0.0
+    # Tiny negatives beside a large value in the same block round to -0 after scaling.
+    x[3, :, :4] = torch.tensor([-0.0, -1e-3, -torch.finfo(dtype).tiny, 64.0], dtype=dtype, device="cuda")
+    amax = compute_nvfp4_amax(x)
+    assert amax[1] == 0 and amax[2] > amax[4] > amax[3] > amax[0] > 0
+
+    actual = fused_nvfp4_qdq(x, amax, config)
+    # The all-negative-zero expert beside the 1e3 expert keeps its sign bits (TE's E2M1 contract for zero blocks).
+    assert torch.equal(actual[1].view(torch.uint16), x[1].view(torch.uint16))
+    assert (actual[3, :, :3] == 0).all() and torch.equal(torch.signbit(actual[3, :, :4]), torch.signbit(x[3, :, :4]))
+    assert torch.equal(actual[3].view(torch.uint16), _te_qdq_reference(x[3], config)[0].view(torch.uint16))
+    # Quantizing an expert against a neighbour's amax changes its bits, so equality proves per-expert scaling.
+    assert torch.equal(actual[3].view(torch.uint16), fused_nvfp4_qdq(x[3], amax[3], config).view(torch.uint16))
+    assert not torch.equal(actual[3], fused_nvfp4_qdq(x[3], amax[2], config))
+    permutation = torch.tensor([2, 0, 4, 1, 3], device="cuda")
+    permuted = fused_nvfp4_qdq(x[permutation], amax[permutation], config)
+    assert torch.equal(permuted.view(torch.uint16), actual[permutation].view(torch.uint16))
 
 
 def test_fused_nvfp4_qdq_uses_straight_through_gradient_and_preserves_main_grad() -> None:
@@ -606,6 +670,51 @@ def test_fused_nvfp4_qdq_uses_straight_through_gradient_and_preserves_main_grad(
 
     torch.testing.assert_close(x.grad, torch.ones_like(x), rtol=0.0, atol=0.0)
     assert output.main_grad is main_grad
+
+
+def _require_packed_grouped_weight() -> None:
+    """Skip where TE (< 2.19) or cuBLASLt (< 13.3) lacks the single-grouped-weight GEMM path."""
+    grouped_linear = pytest.importorskip("transformer_engine.pytorch.module.grouped_linear")
+    is_supported = getattr(grouped_linear, "is_module_grouped_tensor_path_supported", None)
+    if is_supported is None or not is_supported(None, torch.bfloat16):
+        pytest.skip("TE native grouped GEMM path is unavailable on this TE/device/cuBLASLt")
+
+
+def _make_packed_weight(x: torch.Tensor) -> GroupedTensor:
+    """Wrap a fresh copy of a [G, N, K] payload as a leaf TE grouped weight."""
+    num_groups, rows, cols = x.shape
+    weight = GroupedTensor.make_grouped_tensor_from_rowwise_data(
+        num_tensors=num_groups, tensor_shape=(rows, cols), rowwise_data=x.detach().clone().view(-1), internal=False
+    )
+    return weight.requires_grad_(True)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("config", NVFP4_QDQ_CONFIGS)
+def test_fake_nvfp4_quantization_ste_is_identity_for_nonuniform_grouped_gradients(
+    dtype: torch.dtype, config: NVFP4QDQConfig
+) -> None:
+    _require_packed_grouped_weight()
+    shape = (4, 33, 64)
+    x = _make_grouped_qdq_input(shape[1:], dtype, "random", shape[0])
+    weight = _make_packed_weight(x)
+    expected = fused_nvfp4_qdq(x, compute_nvfp4_amax(x), config)
+
+    output = fake_nvfp4_quantization_ste(weight, config)
+
+    assert isinstance(output, GroupedTensor) and output.requires_grad and output.grad_fn is not None
+    assert output.quantizer is None and output.num_tensors == shape[0] and tuple(output.shape) == shape
+    assert output.rowwise_data.data_ptr() != weight.rowwise_data.data_ptr()
+    assert torch.equal(output.rowwise_data.view(shape).view(torch.uint16), expected.view(torch.uint16))
+    assert not torch.equal(output.rowwise_data.view(shape), x)
+
+    torch.manual_seed(1)
+    grad_output = torch.randn(shape, dtype=dtype, device="cuda")
+    output.backward(grad_output)
+
+    assert weight.grad is not None and tuple(weight.grad.shape) == shape
+    assert torch.equal(weight.grad, grad_output)
+    assert torch.equal(weight.rowwise_data.view(shape), x)
 
 
 @pytest.mark.parametrize(
@@ -678,17 +787,37 @@ def test_current_nvfp4_qdq_config_rejects_non_numeric_bool_flags(
         current_nvfp4_qdq_config()
 
 
+@pytest.mark.parametrize("four_over_six", [False, True], ids=["nvfp4", "w4a16"])
+@pytest.mark.parametrize("single_grouped_weight", [False, True], ids=["discrete", "packed"])
 def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
     monkeypatch: pytest.MonkeyPatch,
+    single_grouped_weight: bool,
+    four_over_six: bool,
 ) -> None:
+    """Discrete weight{g} parameters, or TE 2.19's single grouped weight fake-quantized by one grouped launch."""
+    if single_grouped_weight:
+        _require_packed_grouped_weight()
     from megatron.core.extensions import transformer_engine as te_extension
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    group_count, rows, columns = 3, 2, 32
+    group_count, columns = 3, 32
+    # Observed with TE 2.19 + cuBLASLt 13.3: the single-grouped-weight grouped GEMM returned a wrong forward for
+    # output_size=2 (token row 2 of m_splits [2, 1, 3] zero) and matches the per-expert reference from N = 8, i.e.
+    # with 16-byte-aligned per-expert output rows. The discrete arm keeps the odd N = 2 tail.
+    rows = 8 if single_grouped_weight else 2
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
-    monkeypatch.setenv("NVTE_NVFP4_4OVER6", "none")
+    if four_over_six:
+        # The W4A16 recipe: 4over6 with the MSE error mode and FP16-rounded candidate error.
+        monkeypatch.setenv("NVTE_NVFP4_4OVER6", "all")
+        monkeypatch.setenv("NVTE_NVFP4_4OVER6_E4M3_USE_256", "none")
+        monkeypatch.setenv("NVTE_NVFP4_4OVER6_ERR_MODE", "MSE")
+        monkeypatch.setenv("NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH", "1")
+    else:
+        monkeypatch.setenv("NVTE_NVFP4_4OVER6", "none")
+        monkeypatch.setenv("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE")
     monkeypatch.delenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", raising=False)
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1" if single_grouped_weight else "0")
     monkeypatch.setenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0")
     monkeypatch.setenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "1")
     config = TransformerConfig(
@@ -697,7 +826,9 @@ def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
         num_attention_heads=1,
         params_dtype=torch.bfloat16,
         gradient_accumulation_fusion=False,
-        moe_single_grouped_weight=False,
+        moe_grouped_gemm=single_grouped_weight,
+        moe_use_grouped_tensor=single_grouped_weight,
+        moe_single_grouped_weight=single_grouped_weight,
     )
     pg_collection = ProcessGroupCollection()
     pg_collection.expt_tp = None
@@ -715,17 +846,32 @@ def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
     )
 
     assert layer.fuse_wgrad_accumulation is False
-    assert not getattr(layer, "single_grouped_weight", False)
-    assert getattr(layer, "weight", None) is None
-    weights = [getattr(layer, f"weight{group_idx}") for group_idx in range(group_count)]
-    assert set(dict(layer.named_parameters())) == {f"weight{group_idx}" for group_idx in range(group_count)}
+    assert getattr(layer, "single_grouped_weight", False) is single_grouped_weight
+    if single_grouped_weight:
+        assert isinstance(layer.weight, GroupedTensor) and layer.weight.quantizer is None
+        assert set(dict(layer.named_parameters())) == {"weight"}
+        weights = list(layer.weight.rowwise_data.view(group_count, rows, columns))
+    else:
+        assert getattr(layer, "weight", None) is None
+        weights = [getattr(layer, f"weight{group_idx}") for group_idx in range(group_count)]
+        assert set(dict(layer.named_parameters())) == {f"weight{group_idx}" for group_idx in range(group_count)}
 
     actual_weights = te_extension.TEGroupedLinear._get_weight_tensors(layer)
     qdq_config = current_nvfp4_qdq_config()
+    assert qdq_config == (
+        NVFP4QDQConfig(use_4over6=True, error_mode=NVFP4QDQErrorMode.MSE, error_use_fast_math=True)
+        if four_over_six
+        else NVFP4QDQConfig()
+    )
     expected_weights = [_te_qdq_reference(weight, qdq_config)[0] for weight in weights]
 
-    assert len(actual_weights) == group_count
     assert all(weight.requires_grad for weight in actual_weights)
+    if single_grouped_weight:
+        # One grouped launch over a fresh payload; the registered parameter keeps the high-precision weights.
+        assert len(actual_weights) == 1 and isinstance(actual_weights[0], GroupedTensor)
+        assert actual_weights[0].rowwise_data.data_ptr() != layer.weight.rowwise_data.data_ptr()
+        actual_weights = list(actual_weights[0].rowwise_data.view(group_count, rows, columns))
+    assert len(actual_weights) == group_count
     assert all(
         torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
         for actual, expected in zip(actual_weights, expected_weights, strict=False)
@@ -733,37 +879,166 @@ def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
 
     m_splits = [2, 1, 3]
     inp = torch.ones((sum(m_splits), columns), dtype=torch.bfloat16, device="cuda", requires_grad=True)
-    output, bias = layer(inp, m_splits)
+    # TE's native grouped-tensor GEMM path takes the splits as a CUDA int64 tensor (no host sync).
+    output, bias = layer(inp, torch.tensor(m_splits, device="cuda") if single_grouped_weight else m_splits)
     output.backward(torch.ones_like(output))
 
     assert bias is None
     assert tuple(output.shape) == (sum(m_splits), rows)
     assert inp.grad is not None and torch.isfinite(inp.grad).all()
-    for weight, m_split in zip(weights, m_splits, strict=False):
-        assert weight.grad is not None
-        torch.testing.assert_close(weight.grad, torch.full_like(weight.grad, m_split), rtol=0, atol=0)
+    if single_grouped_weight:
+        # Autograd accumulates the packed [G, N, K] gradient on the original grouped parameter.
+        assert layer.weight.grad is not None and tuple(layer.weight.grad.shape) == (group_count, rows, columns)
+        grads = list(layer.weight.grad)
+    else:
+        grads = [weight.grad for weight in weights]
+    for grad, m_split in zip(grads, m_splits, strict=False):
+        assert grad is not None
+        torch.testing.assert_close(grad, torch.full_like(grad, m_split), rtol=0, atol=0)
+
+    # Random microbatches with a zero-token expert against the per-expert QDQ + matmul reference, wgrad accumulated
+    # over two microbatches into the registered parameters, then SGD steps whose updated payload the next forward
+    # must read through the same storage.
+    gemm_tolerance = {"rtol": 1e-2, "atol": 5e-3}
+    m_splits = [5, 0, 3]
+    splits = torch.tensor(m_splits, device="cuda") if single_grouped_weight else m_splits
+    optimizer = torch.optim.SGD(layer.parameters(), lr=1e-2)
+    payload_ptrs = [w.data_ptr() for w in ([layer.weight.rowwise_data] if single_grouped_weight else weights)]
+    torch.manual_seed(0)
+    for step in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        previous_weights, expected_weights = expected_weights, [
+            fused_nvfp4_qdq(weight.detach(), compute_nvfp4_amax(weight), qdq_config) for weight in weights
+        ]
+        assert (step == 0) == all(torch.equal(w, p) for w, p in zip(expected_weights, previous_weights, strict=True))
+        wgrad_ref = [torch.zeros_like(weight, dtype=torch.float32) for weight in weights]
+        for microbatch in range(2):
+            inp = torch.randn((sum(m_splits), columns), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+            grad_output = torch.randn((sum(m_splits), rows), dtype=torch.bfloat16, device="cuda") * (1 + microbatch)
+            output, _ = layer(inp, splits)
+            output.backward(grad_output)
+            x_splits, dy_splits = inp.split(m_splits), grad_output.split(m_splits)
+            expected = torch.cat([x @ w.t() for x, w in zip(x_splits, expected_weights, strict=True)])
+            stale = torch.cat([x @ w.t() for x, w in zip(x_splits, previous_weights, strict=True)])
+            expected_dgrad = torch.cat([dy @ w for dy, w in zip(dy_splits, expected_weights, strict=True)])
+            torch.testing.assert_close(output.float(), expected.float(), **gemm_tolerance)
+            torch.testing.assert_close(inp.grad.float(), expected_dgrad.float(), **gemm_tolerance)
+            assert (step == 0) == torch.allclose(output.float(), stale.float(), **gemm_tolerance)
+            for wgrad, dy, x in zip(wgrad_ref, dy_splits, x_splits, strict=True):
+                wgrad += dy.float().t() @ x.float()
+        grads = list(layer.weight.grad) if single_grouped_weight else [weight.grad for weight in weights]
+        # TE emits each microbatch's wgrad in BF16 and autograd accumulates in BF16: two roundings of values up to
+        # |wgrad|max, hence the absolute term scales with the reference magnitude (exact zero for the empty expert).
+        for grad, wgrad in zip(grads, wgrad_ref, strict=True):
+            torch.testing.assert_close(grad.float(), wgrad, rtol=1e-2, atol=1e-2 * wgrad.abs().max().item())
+        optimizer.step()
+        assert payload_ptrs == [
+            w.data_ptr() for w in ([layer.weight.rowwise_data] if single_grouped_weight else weights)
+        ]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_fused_nvfp4_qdq_rejects_unsupported_input_dtype(dtype: torch.dtype) -> None:
-    x = torch.randn((2, 16), dtype=dtype, device="cuda")
+@pytest.mark.parametrize("shape", [(2, 16), (3, 2, 16)], ids=["rank-2", "rank-3"])
+def test_fused_nvfp4_qdq_rejects_unsupported_input_dtype(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
+    x = torch.randn(shape, dtype=dtype, device="cuda")
     with pytest.raises(TypeError, match="supports BF16 and FP16"):
-        fused_nvfp4_qdq(x, x.abs().amax().float(), NVFP4QDQConfig())
+        fused_nvfp4_qdq(x, x.abs().amax(dim=(-2, -1)).float(), NVFP4QDQConfig())
 
 
-def test_fused_nvfp4_qdq_rejects_non_block_aligned_k() -> None:
-    x = torch.randn((2, 17), dtype=torch.bfloat16, device="cuda")
+@pytest.mark.parametrize("shape", [(2, 17), (3, 2, 17)], ids=["rank-2", "rank-3"])
+def test_fused_nvfp4_qdq_rejects_non_block_aligned_k(shape: tuple[int, ...]) -> None:
+    x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="K divisible by 16"):
         fused_nvfp4_qdq(x, compute_nvfp4_amax(x), NVFP4QDQConfig())
 
 
-def test_fused_nvfp4_qdq_rejects_misaligned_contiguous_storage() -> None:
-    storage = torch.randn(33, dtype=torch.bfloat16, device="cuda")
-    x = storage[1:].view(2, 16)
+@pytest.mark.parametrize("shape", [(2, 16), (3, 2, 16)], ids=["rank-2", "rank-3"])
+def test_fused_nvfp4_qdq_rejects_misaligned_contiguous_storage(shape: tuple[int, ...]) -> None:
+    storage = torch.randn(torch.Size(shape).numel() + 1, dtype=torch.bfloat16, device="cuda")
+    x = storage[1:].view(shape)
     assert x.is_contiguous()
     assert x.data_ptr() % 16 != 0
     with pytest.raises(ValueError, match="16-byte-aligned"):
         fused_nvfp4_qdq(x, compute_nvfp4_amax(x), NVFP4QDQConfig())
+
+
+@pytest.mark.parametrize("shape", [(16, 4), (3, 16, 4)], ids=["rank-2", "rank-3"])
+def test_fused_nvfp4_qdq_rejects_non_contiguous_input(shape: tuple[int, ...]) -> None:
+    x = torch.randn(shape, dtype=torch.bfloat16, device="cuda").transpose(-1, -2)
+    with pytest.raises(ValueError, match="contiguous"):
+        fused_nvfp4_qdq(x, compute_nvfp4_amax(x), NVFP4QDQConfig())
+
+
+@pytest.mark.parametrize("shape", [(2, 16), (3, 2, 16)], ids=["rank-2", "rank-3"])
+def test_fused_nvfp4_qdq_rejects_cpu_input(shape: tuple[int, ...]) -> None:
+    x = torch.randn(shape, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        fused_nvfp4_qdq(x, compute_nvfp4_amax(x), NVFP4QDQConfig())
+
+
+@pytest.mark.parametrize(
+    ("shape", "match"),
+    [
+        pytest.param((2, 2, 4, 16), "rank", id="rank-4"),
+        pytest.param((65536, 1, 16), "at most 65535", id="too-many-groups"),
+        pytest.param((1, 2**16, 2**15 + 16), "at most 2147483647 elements", id="oversized-expert"),
+        pytest.param((0, 4, 16), "empty", id="zero-groups"),
+        pytest.param((2, 0, 16), "empty", id="zero-rows"),
+    ],
+)
+def test_fused_nvfp4_qdq_rejects_invalid_grouped_shapes(shape: tuple[int, ...], match: str) -> None:
+    try:
+        # Uninitialized, so the 2**31 + 2**20 element expert only costs its 4.3 GB allocation.
+        x = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    except torch.OutOfMemoryError:
+        pytest.skip(f"shape {shape} does not fit in device memory")
+    with pytest.raises(ValueError, match=match):
+        fused_nvfp4_qdq(x, torch.ones((shape[0],), dtype=torch.float32, device="cuda"), NVFP4QDQConfig())
+
+
+@pytest.mark.parametrize("shape", [(0, 16), (2, 0, 16)], ids=["rank-2", "rank-3"])
+def test_compute_nvfp4_amax_rejects_empty_input(shape: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="empty"):
+        compute_nvfp4_amax(torch.empty(shape, dtype=torch.bfloat16, device="cuda"))
+
+
+@pytest.mark.parametrize(
+    ("make_amax", "error_type", "match"),
+    [
+        pytest.param(lambda: torch.ones((3,), dtype=torch.float32, device="cuda"), TypeError, "amax", id="shape"),
+        pytest.param(lambda: torch.ones((2,), dtype=torch.bfloat16, device="cuda"), TypeError, "FP32", id="dtype"),
+        pytest.param(lambda: torch.ones((2,), dtype=torch.float32), ValueError, "CUDA device", id="cpu"),
+        pytest.param(
+            lambda: torch.ones((4,), dtype=torch.float32, device="cuda")[::2], ValueError, "contiguous", id="strided"
+        ),
+    ],
+)
+def test_fused_nvfp4_qdq_rejects_invalid_grouped_amax(make_amax, error_type: type[Exception], match: str) -> None:
+    x = torch.randn((2, 4, 16), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(error_type, match=match):
+        fused_nvfp4_qdq(x, make_amax(), NVFP4QDQConfig())
+
+
+def test_fused_nvfp4_qdq_packed_weight_rejects_non_packed_weights() -> None:
+    _require_packed_grouped_weight()
+    x = _make_grouped_qdq_input((4, 16), torch.bfloat16, "random", 2)
+    with pytest.raises(TypeError, match="GroupedTensor"):
+        fused_nvfp4_qdq_packed_weight(x)
+    quantized = _make_packed_weight(x)
+    quantized.quantizer = _make_te_qdq_quantizer(NVFP4QDQConfig())
+    with pytest.raises(ValueError, match="quantizer"):
+        fused_nvfp4_qdq_packed_weight(quantized)
+    # TE marks ragged experts by materialized per-tensor first dims, not by the shapes list alone.
+    ragged = GroupedTensor(
+        (7, 16),
+        x.dtype,
+        num_tensors=2,
+        shapes=[(3, 16), (4, 16)],
+        data=x.new_empty(7 * 16),
+        first_dims=torch.tensor([3, 4], device="cuda"),
+    )
+    with pytest.raises(ValueError, match="uniform"):
+        fused_nvfp4_qdq_packed_weight(ragged)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
@@ -783,6 +1058,61 @@ def test_fused_nvfp4_qdq_uses_and_restores_non_current_device() -> None:
         assert torch.cuda.current_device() == primary_device
 
     assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("config", NVFP4_QDQ_CONFIGS)
+def test_fused_nvfp4_qdq_replays_grouped_amax_and_qdq_in_cuda_graph(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, config: NVFP4QDQConfig
+) -> None:
+    shape = (4, 64, 256)
+    static_x = _make_grouped_qdq_input(shape[1:], dtype, "random", shape[0])
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        # Compilation happens here; the capture below must only record launches.
+        for _ in range(2):
+            fused_nvfp4_qdq(static_x, compute_nvfp4_amax(static_x), config)
+    torch.cuda.current_stream().wait_stream(side_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side_stream):
+        static_amax = compute_nvfp4_amax(static_x)
+        static_y = fused_nvfp4_qdq(static_x, static_amax, config)
+
+    for replay in range(3):
+        torch.manual_seed(100 + replay)
+        magnitudes = torch.tensor([10.0 ** ((g + replay) % 4 - 1) for g in range(shape[0])], device="cuda")
+        x = (torch.randn(shape, device="cuda") * magnitudes.view(shape[0], 1, 1)).to(dtype=dtype)
+        static_x.copy_(x)
+        graph.replay()
+        torch.cuda.synchronize()
+        eager_amax = compute_nvfp4_amax(x)
+        assert torch.equal(static_amax, eager_amax)
+        assert torch.equal(static_y.view(torch.uint16), fused_nvfp4_qdq(x, eager_amax, config).view(torch.uint16))
+
+    # An uncompiled specialization must refuse to compile inside a capture instead of recording garbage.
+    monkeypatch.setattr("miles.utils.fused_nvfp4_qdq._KERNEL_CACHE", {})
+    with pytest.raises(RuntimeError, match="Warm up"):
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=side_stream):
+            fused_nvfp4_qdq(static_x, compute_nvfp4_amax(static_x), config)
+
+
+@torch.inference_mode()
+def test_fused_nvfp4_qdq_addresses_grouped_payload_beyond_int32_elements() -> None:
+    # 2**31 + 2**28 elements over 96 experts (4.8 GB in, 4.8 GB out): each expert stays below the per-expert
+    # limit while the expert bases cross 2**31 elements and 2**32 bytes.
+    shape = (96, 4096, 6144)
+    try:
+        x = torch.empty(shape, dtype=torch.bfloat16, device="cuda").normal_()
+    except torch.OutOfMemoryError:
+        pytest.skip("the 64-bit addressing check needs a 9.7 GB allocation")
+    x *= torch.tensor([10.0 ** (g % 3 - 1) for g in range(shape[0])], dtype=x.dtype, device="cuda").view(-1, 1, 1)
+    amax = compute_nvfp4_amax(x)
+    actual = fused_nvfp4_qdq(x, amax, NVFP4QDQConfig())
+    for expert, expert_amax, expert_actual in zip(x, amax, actual, strict=True):
+        expected = fused_nvfp4_qdq(expert, expert_amax, NVFP4QDQConfig())
+        assert torch.equal(expert_actual.view(torch.uint16), expected.view(torch.uint16))
 
 
 class TestNVFP4FakeQATAdapter:
@@ -825,6 +1155,49 @@ class TestNVFP4FakeQATAdapter:
         assert all(value is expected_value for value, expected_value in zip(actual, expected, strict=False))
         assert all(weight is call[0] for weight, call in zip(weights, calls, strict=False))
         assert all(call[1] is qdq_config for call in calls)
+
+    def test_packed_path_makes_one_grouped_call_and_requires_module_flags(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _require_packed_grouped_weight()
+        packed = [_make_packed_weight(torch.empty(3, 4, 16))]
+        discrete = [torch.nn.Parameter(torch.empty(4, 16)) for _ in range(3)]
+        expected = _make_packed_weight(torch.empty(3, 4, 16))
+        qdq_config = object()
+        calls = []
+        fake_module = ModuleType("miles.utils.fused_nvfp4_qdq")
+
+        def fake_qdq(weight, config):
+            calls.append((weight, config))
+            return expected if isinstance(weight, GroupedTensor) else weight
+
+        fake_module.current_nvfp4_qdq_config = lambda: qdq_config
+        fake_module.fake_nvfp4_quantization_ste = fake_qdq
+        monkeypatch.setitem(sys.modules, "miles.utils.fused_nvfp4_qdq", fake_module)
+        monkeypatch.setenv(nvfp4_qat.NVFP4_FAKE_QAT_FLAG, "1")
+
+        actual_packed = nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(
+            packed, fuse_wgrad_accumulation=False, delay_wgrad_compute=False
+        )
+        actual_discrete = nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(
+            discrete, fuse_wgrad_accumulation=False, delay_wgrad_compute=False
+        )
+
+        assert len(actual_packed) == 1 and actual_packed[0] is expected
+        assert len(actual_discrete) == len(discrete)
+        assert all(value is weight for value, weight in zip(actual_discrete, discrete, strict=False))
+        assert all(weight is call[0] for weight, call in zip([*packed, *discrete], calls, strict=True))
+        assert all(call[1] is qdq_config for call in calls)
+
+        # A caller that does not state the module flags (the pre-companion Megatron hook) must fail closed.
+        with pytest.raises(NotImplementedError, match="needs the caller to pass"):
+            nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(packed)
+        for kwargs in (
+            {"fuse_wgrad_accumulation": True, "delay_wgrad_compute": False},
+            {"fuse_wgrad_accumulation": False, "delay_wgrad_compute": True},
+        ):
+            with pytest.raises(NotImplementedError, match="gradient_accumulation_fusion=False"):
+                nvfp4_qat.maybe_fake_quantize_nvfp4_weight_tensors(packed, **kwargs)
 
 
 if __name__ == "__main__":
