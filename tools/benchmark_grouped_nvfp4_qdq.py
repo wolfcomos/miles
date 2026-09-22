@@ -3,8 +3,8 @@
 Kernel-only paths (reference-only stacking never enters the timed region):
   per_expert_qdq       Miles ``fused_nvfp4_qdq`` per expert; contiguous views and amax precomputed
   per_expert_amax_qdq  per-expert ``compute_nvfp4_amax`` + ``fused_nvfp4_qdq``
-  grouped_qdq          ``fused_grouped_nvfp4_qdq`` with precomputed per-group amax
-  grouped_amax_qdq     ``compute_grouped_nvfp4_amax`` + ``fused_grouped_nvfp4_qdq``
+  grouped_qdq          ``fused_nvfp4_qdq`` on the [G, N, K] payload with precomputed per-group amax
+  grouped_amax_qdq     ``compute_nvfp4_amax`` + ``fused_nvfp4_qdq`` on the [G, N, K] payload
   te_per_expert_qdq    production TE ``NVFP4Quantizer`` (rowwise, no RHT/2D/SR) quantize + dequantize per expert
 Adapter paths (complete ``maybe_fake_quantize_nvfp4_weight_tensors`` latency on a TE GroupedLinear):
   adapter_packed       single grouped weight: amax + grouped QDQ + GroupedTensor wrap + STE
@@ -41,7 +41,6 @@ import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
 from transformer_engine.pytorch.module.grouped_linear import GroupedLinear
 
-from miles.utils.fused_grouped_nvfp4_qdq import compute_grouped_nvfp4_amax, fused_grouped_nvfp4_qdq
 from miles.utils.fused_nvfp4_qdq import (
     NVFP4QDQConfig,
     NVFP4QDQErrorMode,
@@ -179,12 +178,12 @@ def _time_eager(fn: Callable[[], Any], warmup: int, iters: int) -> dict[str, flo
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     wall_start = time.perf_counter()
-    for start, end in zip(starts, ends):
+    for start, end in zip(starts, ends, strict=True):
         start.record()
         fn()
         end.record()
     torch.cuda.synchronize()
-    stats = _stats_us([start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)])
+    stats = _stats_us([start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends, strict=True)])
     stats["wall_mean_us"] = (time.perf_counter() - wall_start) * 1e6 / iters
     return stats
 
@@ -269,13 +268,13 @@ def _kernel_paths(
 ) -> dict[str, Callable[[], Any]]:
     views = [x[g] for g in range(x.shape[0])]
     amax_list = [compute_nvfp4_amax(view) for view in views]
-    amax = compute_grouped_nvfp4_amax(x)
+    amax = compute_nvfp4_amax(x)
     dtype = x.dtype
     return {
-        "per_expert_qdq": lambda: [fused_nvfp4_qdq(view, a, config) for view, a in zip(views, amax_list)],
+        "per_expert_qdq": lambda: [fused_nvfp4_qdq(view, a, config) for view, a in zip(views, amax_list, strict=True)],
         "per_expert_amax_qdq": lambda: [fused_nvfp4_qdq(view, compute_nvfp4_amax(view), config) for view in views],
-        "grouped_qdq": lambda: fused_grouped_nvfp4_qdq(x, amax, config),
-        "grouped_amax_qdq": lambda: fused_grouped_nvfp4_qdq(x, compute_grouped_nvfp4_amax(x), config),
+        "grouped_qdq": lambda: fused_nvfp4_qdq(x, amax, config),
+        "grouped_amax_qdq": lambda: fused_nvfp4_qdq(x, compute_nvfp4_amax(x), config),
         "te_per_expert_qdq": lambda: [quantizer.quantize(view).dequantize(dtype=dtype) for view in views],
     }
 
@@ -289,7 +288,7 @@ def _bitwise_checks(x: torch.Tensor, paths: dict[str, Callable[[], Any]]) -> dic
     return {
         "grouped_eq_per_expert": torch.equal(grouped.view(torch.int16), per_expert.view(torch.int16)),
         "grouped_eq_te": torch.equal(grouped.view(torch.int16), te_out.view(torch.int16)),
-        "grouped_amax_eq_per_expert": torch.equal(compute_grouped_nvfp4_amax(x), per_expert_amax),
+        "grouped_amax_eq_per_expert": torch.equal(compute_nvfp4_amax(x), per_expert_amax),
     }
 
 

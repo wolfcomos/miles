@@ -40,8 +40,7 @@ from megatron.training.global_vars import destroy_global_vars, get_args, set_arg
 import megatron.training.training as megatron_training  # noqa: E402
 from megatron.training.training import setup_model_and_optimizer  # noqa: E402
 
-import miles.utils.fused_grouped_nvfp4_qdq as grouped_qdq_module  # noqa: E402
-from miles.utils.fused_grouped_nvfp4_qdq import compute_grouped_nvfp4_amax, fused_grouped_nvfp4_qdq  # noqa: E402
+import miles.utils.fused_nvfp4_qdq as qdq_module  # noqa: E402
 from miles.utils.fused_nvfp4_qdq import compute_nvfp4_amax, current_nvfp4_qdq_config, fused_nvfp4_qdq  # noqa: E402
 from miles.utils.nvfp4_fake_qat import NVFP4_FAKE_QAT_FLAG  # noqa: E402
 
@@ -82,7 +81,7 @@ class _QdqCapture:
 
     def __init__(self):
         self.calls = []
-        self._orig = grouped_qdq_module.fake_grouped_nvfp4_quantization_ste
+        self._orig = qdq_module.fused_nvfp4_qdq_packed_weight
 
     def install(self):
         def wrapped(weight, config=None):
@@ -96,11 +95,11 @@ class _QdqCapture:
             )
             return out
 
-        grouped_qdq_module.fake_grouped_nvfp4_quantization_ste = wrapped
+        qdq_module.fused_nvfp4_qdq_packed_weight = wrapped
         return self
 
     def remove(self):
-        grouped_qdq_module.fake_grouped_nvfp4_quantization_ste = self._orig
+        qdq_module.fused_nvfp4_qdq_packed_weight = self._orig
 
 
 def _per_expert_qdq(payload, num_local, cfg):
@@ -241,7 +240,7 @@ def case_ep1_parity(opts):
     assert not capture.calls  # discrete weights take the per-tensor path
     out, dx, dp = run(packed)
     assert len(capture.calls) == 2, len(capture.calls)  # fc1 + fc2, one packed launch each
-    for (ptr, w_in, w_out), linear in zip(capture.calls, (packed.linear_fc1, packed.linear_fc2)):
+    for (ptr, w_in, w_out), linear in zip(capture.calls, (packed.linear_fc1, packed.linear_fc2), strict=True):
         assert ptr == linear.weight.rowwise_data.data_ptr()
         _assert_bitwise(
             w_out.view_as(_expert_weights(linear, G)), _per_expert_qdq(_expert_weights(linear, G), G, cfg), "QDQ"
@@ -499,11 +498,11 @@ def case_accumulation(opts):
         assert len(capture.calls) == 4, len(capture.calls)
         for ptr, w_in, w_out in capture.calls[0::2]:
             assert ptr == fc1.weight.rowwise_data.data_ptr() and torch.equal(w_in, before)
-            grouped = fused_grouped_nvfp4_qdq(
+            grouped = fused_nvfp4_qdq(
                 w_in.view(G, fc1.out_features, fc1.in_features),
-                compute_grouped_nvfp4_amax(w_in.view(G, -1, fc1.in_features)),
+                compute_nvfp4_amax(w_in.view(G, -1, fc1.in_features)),
             )
-            _assert_bitwise(w_out.view_as(grouped), grouped, "fc1 QDQ vs fused_grouped_nvfp4_qdq(payload)")
+            _assert_bitwise(w_out.view_as(grouped), grouped, "fc1 QDQ vs fused_nvfp4_qdq(payload)")
             _assert_bitwise(w_out.view_as(grouped), _pre_qdq(fc1, G), "fc1 QDQ vs per-expert oracle")
         ok, _, _ = optimizer.step()
         assert ok

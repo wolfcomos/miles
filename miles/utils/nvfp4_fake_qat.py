@@ -44,9 +44,6 @@ def maybe_fake_quantize_nvfp4_weight_tensors(
                 "delay_wgrad_compute=False: TE writes fused/delayed weight gradients onto the "
                 "weight object it receives, which would be the fake-quantized copy."
             )
-        from miles.utils.fused_grouped_nvfp4_qdq import fake_grouped_nvfp4_quantization_ste
-
-        return [fake_grouped_nvfp4_quantization_ste(weight_tensors[0], qdq_config)]
     return [fake_nvfp4_quantization_ste(weight, qdq_config) for weight in weight_tensors]
 
 
