@@ -22,14 +22,18 @@ def parallelize_kimi_k3(model, *, parallel_dims, training, parallelism, compile_
     for layer in model.layers.values():
         attention = layer.self_attn
         if isinstance(attention, DeltaAttention):
-            for module in (
+            fp32_modules = [
                 attention.core,
                 attention.q_conv1d,
                 attention.k_conv1d,
                 attention.v_conv1d,
                 attention.o_norm,
-            ):
-                fully_shard(module, mesh=mesh, mp_policy=fp32)
+            ]
+            if parallel_dims.tp_enabled:
+                fully_shard(fp32_modules, mesh=mesh, mp_policy=fp32)
+            else:
+                for module in fp32_modules:
+                    fully_shard(module, mesh=mesh, mp_policy=fp32)
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)

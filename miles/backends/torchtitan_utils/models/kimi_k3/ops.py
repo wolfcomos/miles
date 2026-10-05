@@ -35,6 +35,12 @@ class RMSNorm(Module):
         nn.init.ones_(self.weight)
 
     def forward(self, x):
+        if _local_norm_layout(x):
+            # Preserve the DTensor cast boundary and the TP partial weight gradient.
+            weight = local_tensor(self.weight.to(x.dtype), partial_grad=True)
+            local_x = x.to_local()
+            value = local_x.float() * torch.rsqrt(local_x.float().square().mean(-1, keepdim=True) + self.eps)
+            return wrap_like(value.to(x.dtype) * weight, x)
         value = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
         return value.to(x.dtype) * self.weight.to(x.dtype)
 
@@ -77,8 +83,28 @@ def wrap_like(tensor, reference):
     return tensor
 
 
+def _local_norm_layout(tensor):
+    """Local reductions are valid only when the feature dimension is complete."""
+    if not isinstance(tensor, DTensor):
+        return False
+    return (
+        any(placement.is_shard() for placement in tensor.placements)
+        and all(not placement.is_partial() for placement in tensor.placements)
+        and all(
+            not placement.is_shard() or placement.dim % tensor.ndim != tensor.ndim - 1
+            for placement in tensor.placements
+        )
+    )
+
+
 class GatedRMSNorm(RMSNorm):
     def forward(self, x, gate):
+        if _local_norm_layout(x) and isinstance(gate, DTensor) and gate.placements == x.placements:
+            weight = local_tensor(self.weight.float(), partial_grad=True)
+            local_x, local_gate = x.to_local(), gate.to_local()
+            value = local_x.float() * torch.rsqrt(local_x.float().square().mean(-1, keepdim=True) + self.eps)
+            output = (value * weight * local_gate.float().sigmoid()).to(x.dtype)
+            return wrap_like(output, x)
         value = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
         return (value * self.weight.float() * gate.float().sigmoid()).to(x.dtype)
 
@@ -131,6 +157,15 @@ class KimiTokenDispatcher(AllToAllTokenDispatcher):
 
 
 def attention_residual(prefix, bank, norm, proj):
+    if _local_norm_layout(prefix) and isinstance(bank, DTensor) and bank.placements == prefix.placements:
+        norm_weight = local_tensor(norm.weight.float(), partial_grad=True)
+        proj_weight = local_tensor(proj.weight.float(), partial_grad=True)
+        values = torch.cat((bank.to_local(), prefix.to_local().unsqueeze(-2)), dim=-2)
+        values_float = values.float()
+        keys = values_float * torch.rsqrt(values_float.square().mean(-1, keepdim=True) + norm.eps)
+        scores = (keys * (norm_weight * proj_weight.squeeze(0))).sum(-1)
+        output = (scores.softmax(-1).unsqueeze(-2) @ values_float).squeeze(-2).to(values.dtype)
+        return wrap_like(output, prefix)
     values = torch.cat((bank, prefix.unsqueeze(-2)), dim=-2)
     values_float = values.float()
     keys = values_float * torch.rsqrt(values_float.square().mean(-1, keepdim=True) + norm.eps)

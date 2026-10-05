@@ -127,8 +127,19 @@ class TitanTrainer(Trainer):
                 self._bypass_schedule_probe(has_backward=True)
                 self.forward_backward_step(input_dict=input_dicts, labels=labels, global_valid_tokens=ones)
             else:
-                for input_dict, label in zip(input_dicts, labels, strict=True):
-                    self.forward_backward_step(input_dict=input_dict, labels=label, global_valid_tokens=ones)
+                # Experimental: keep parameter buffers between microbatches.
+                # Gradient reduction still occurs after every backward.
+                cache_parameters = len(batches) > 1 and self.parallel_dims.dp_shard == 1
+                try:
+                    for index, (input_dict, label) in enumerate(zip(input_dicts, labels, strict=True)):
+                        if cache_parameters:
+                            for model in self.model_parts:
+                                model.set_reshard_after_backward(index == len(batches) - 1)
+                        self.forward_backward_step(input_dict=input_dict, labels=label, global_valid_tokens=ones)
+                finally:
+                    if cache_parameters:
+                        for model in self.model_parts:
+                            model.set_reshard_after_backward(True)
         return self.loss_fn.collect() if self.has_last_stage() else []
 
     def run_forward(self, batches, compute: Callable) -> list:
