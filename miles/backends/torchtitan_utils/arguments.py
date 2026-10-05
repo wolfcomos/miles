@@ -10,6 +10,10 @@ class TorchtitanArgs(FSDPArgs):
     # torchtitan.models.<name>.model_registry(<flavor>)
     titan_model_name: str = "qwen3"
     titan_model_flavor: str = "0.6B"
+    # BF16 training assets when --hf-checkpoint is a quantized rollout checkpoint.
+    titan_hf_checkpoint: str | None = None
+    # Regex over parameter names; use to reproduce a checkpoint's optimizer grouping.
+    titan_optimizer_no_decay_pattern: str | None = None
 
     seq_length: int = 4096
 

@@ -54,7 +54,7 @@ class TorchtitanTrainRayActor(TorchNativeTrainRayActor):
 
         config = build_trainer_config(
             args,
-            hf_assets_path=args.hf_checkpoint,
+            hf_assets_path=args.titan_hf_checkpoint or args.hf_checkpoint,
             lr_total_steps=args.num_rollout * _steps_per_rollout(args),
             dump_subdir="actor",
         )

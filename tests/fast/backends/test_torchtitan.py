@@ -41,6 +41,34 @@ def test_the_backend_needs_torch_213(monkeypatch):
     validate_torchtitan_args(_args())
 
 
+@pytest.mark.parametrize("accepts_boundaries", [True, False])
+def test_only_models_requesting_boundaries_receive_them(accepts_boundaries):
+    pytest.importorskip("torchtitan")
+    from miles.backends.torchtitan_utils.trainer import TitanTrainer
+
+    class PackedModel:
+        def forward(self, tokens, *, positions=None, cu_seqlens=None):
+            pass
+
+    class PositionModel:
+        def forward(self, tokens, *, positions=None):
+            pass
+
+    trainer = object.__new__(TitanTrainer)
+    trainer.model_parts = [PackedModel() if accepts_boundaries else PositionModel()]
+    trainer.parallel_dims = SimpleNamespace(pp_enabled=False, cp_enabled=False)
+    boundaries = torch.tensor([0, 3, 4, 8], dtype=torch.int32)
+    batch = {
+        "tokens": torch.zeros(1, 8, dtype=torch.long),
+        "position_ids": torch.tensor([[0, 1, 2, 0, 0, 0, 0, 0]]),
+        "cu_seqlens": boundaries,
+    }
+    inputs, _ = trainer._microbatch_inputs([batch])
+    assert ("cu_seqlens" in inputs[0]) == accepts_boundaries
+    if accepts_boundaries:
+        assert inputs[0]["cu_seqlens"] is boundaries
+
+
 def test_the_sequence_must_cover_the_rotary_tables(monkeypatch):
     monkeypatch.setattr(torch, "__version__", "2.13.0")
     with pytest.raises(ValueError, match="seq-length"):
@@ -373,3 +401,62 @@ def test_glm4_7_flash_flavor_matches_its_hf_config_and_its_checkpoint_keys():
 
     adapter = spec.state_dict_adapter(model, None)
     assert set(_GLM47_FLASH_CHECKPOINT_KEYS) <= set(adapter.from_hf_map)
+
+
+def test_optimizer_no_decay_pattern_is_explicit(tmp_path, single_gpu_dims):
+    from miles.backends.torchtitan_utils.config import build_trainer_config
+
+    config = build_trainer_config(
+        _config_args(titan_optimizer_no_decay_pattern=r"(norm\.weight|\.bias)$"),
+        hf_assets_path=_checkpoint_dir(tmp_path, tie_word_embeddings=False),
+        lr_total_steps=2,
+        dump_subdir="x",
+    )
+    assert [group.optimizer_kwargs["weight_decay"] for group in config.optimizer.param_groups] == [0.0, 0.1]
+    assert config.optimizer.param_groups[0].optimizer_kwargs["betas"] == (0.9, 0.98)
+
+
+def test_mxfp4_export_uses_checkpoint_targets_and_bf16_compute_weights(tmp_path):
+    from miles.backends.torchtitan_utils.hf_weight_iterator import Mxfp4Export
+    from miles.utils.mxfp4 import quantize_mxfp4
+
+    config = {
+        "quantization_config": {
+            "format": "mxfp4-pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "type": "float",
+                        "num_bits": 4,
+                        "scale_dtype": "torch.uint8",
+                        "symmetric": True,
+                        "group_size": 32,
+                    }
+                }
+            },
+        }
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.proj.weight_packed": "a.safetensors",
+                    "model.proj.weight_scale": "a.safetensors",
+                    "model.norm.weight": "a.safetensors",
+                }
+            }
+        )
+    )
+    export = Mxfp4Export(str(tmp_path))
+    weight = torch.linspace(-3.01, 3.01, 64).reshape(2, 32)
+    packed, scale = quantize_mxfp4(weight.bfloat16(), 32)
+    unit = export.convert("model.proj.weight", weight)
+    assert [name for name, _ in unit] == ["model.proj.weight_packed", "model.proj.weight_scale"]
+    torch.testing.assert_close(unit[0][1], packed, rtol=0, atol=0)
+    torch.testing.assert_close(unit[1][1], scale, rtol=0, atol=0)
+    assert export.convert("model.norm.weight", weight)[0][1] is weight
+    config["quantization_config"]["format"] = "unhandled-format"
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="only unquantized or MXFP4"):
+        Mxfp4Export(str(tmp_path))

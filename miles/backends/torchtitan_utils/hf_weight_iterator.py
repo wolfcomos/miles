@@ -16,6 +16,7 @@ from miles.backends.training_utils.weight_update.hf_weight_iterator.checkpoint_t
     iter_checkpoint_tower_units,
 )
 from miles.utils.hf_utils.config import load_hf_config
+from miles.utils.mxfp4 import quantize_mxfp4
 
 
 class TitanHfWeightIterator(HfWeightIteratorBase):
@@ -25,11 +26,12 @@ class TitanHfWeightIterator(HfWeightIteratorBase):
         super().__init__(*args, **kwargs)
         self._engine_dtypes = _checkpoint_dtypes(self.args.hf_checkpoint)
         self._q_lora_rank = getattr(load_hf_config(self.args.hf_checkpoint), "q_lora_rank", None) or None
+        self._quantizer = Mxfp4Export(self.args.hf_checkpoint)
 
     def _iter_hf_param_units(self, weights, *, materialize):
         for name, tensor in hf_weights(self.model, complete_across_pp=self.placement.gather_pp):
             if materialize:
-                yield [(name, self._to_engine_dtype(name, tensor))]
+                yield self._quantizer.convert(name, self._to_engine_dtype(name, tensor))
         yield from iter_checkpoint_tower_units(self.args.hf_checkpoint, materialize=materialize)
 
     def _to_engine_dtype(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
@@ -43,6 +45,42 @@ class TitanHfWeightIterator(HfWeightIteratorBase):
 
     def _iter_hf_adapter_units(self, lora_name, adapter, *, materialize):
         raise NotImplementedError("the torchtitan backend has no LoRA")
+
+
+class Mxfp4Export:
+    """Use checkpoint tensor names to select exactly the rollout's packed weights."""
+
+    def __init__(self, checkpoint: str):
+        with open(os.path.join(checkpoint, "config.json")) as source:
+            config = json.load(source)
+        quant = config.get("quantization_config") or config.get("text_config", {}).get("quantization_config")
+        self.targets = set()
+        self.group_size = None
+        if not quant:
+            return
+        if quant.get("format") != "mxfp4-pack-quantized":
+            raise ValueError("TorchTitan weight export currently supports only unquantized or MXFP4 checkpoints")
+        groups = quant.get("config_groups", {})
+        if set(groups) != {"group_0"}:
+            raise ValueError("MXFP4 export requires one checkpoint quantization group")
+        weights = groups["group_0"]["weights"]
+        for key, value in {"type": "float", "num_bits": 4, "scale_dtype": "torch.uint8", "symmetric": True}.items():
+            if weights.get(key) != value:
+                raise ValueError(f"Unsupported MXFP4 weight setting: {key}={weights.get(key)!r}")
+        self.group_size = weights["group_size"]
+        with open(os.path.join(checkpoint, "model.safetensors.index.json")) as source:
+            names = json.load(source)["weight_map"]
+        self.targets = {name.removesuffix(".weight_packed") for name in names if name.endswith(".weight_packed")}
+        if not self.targets or any(name + ".weight_scale" not in names for name in self.targets):
+            raise ValueError("MXFP4 checkpoint must contain matched packed weights and scales")
+
+    def convert(self, name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        base = name.removesuffix(".weight")
+        if not name.endswith(".weight") or base not in self.targets:
+            return [(name, tensor)]
+        # Match Megatron's BF16 model-weight export, not the FP32 optimizer master.
+        packed, scale = quantize_mxfp4(tensor.to(torch.bfloat16), self.group_size)
+        return [(base + ".weight_packed", packed), (base + ".weight_scale", scale)]
 
 
 def hf_weights(trainer, *, complete_across_pp: bool = True) -> Iterator[tuple[str, torch.Tensor]]:

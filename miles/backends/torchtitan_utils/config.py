@@ -1,6 +1,7 @@
 import importlib
 import logging
 import os
+import re
 import tempfile
 from argparse import Namespace
 
@@ -8,7 +9,7 @@ from torchtitan.components.optimizer import ParamGroupConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.trainer import Trainer
 
-from miles.backends.torchtitan_utils.components import EmptyDataLoader, TiedCheckpointManager
+from miles.backends.torchtitan_utils.components import EmptyDataLoader, TiedCheckpointManager, TransformersTokenizer
 from miles.backends.torchtitan_utils.loss import RLLossAdapter
 from miles.backends.torchtitan_utils.parallel import parallel_dims_from_config
 from miles.utils.hf_utils.config import load_hf_config
@@ -68,6 +69,8 @@ def build_trainer_config(args: Namespace, *, hf_assets_path: str, lr_total_steps
         logger.info("Checkpoint ties lm_head to the embedding; excluding lm_head.weight from the HF export")
 
     config.hf_assets_path = hf_assets_path
+    if not os.path.isfile(os.path.join(hf_assets_path, "tokenizer.json")):
+        config.tokenizer = TransformersTokenizer.Config()
     config.dump_folder = os.path.join(
         args.save or tempfile.mkdtemp(prefix="miles-torchtitan-"), "torchtitan", dump_subdir
     )
@@ -106,6 +109,17 @@ def build_trainer_config(args: Namespace, *, hf_assets_path: str, lr_total_steps
             },
         )
     ]
+    no_decay_pattern = getattr(args, "titan_optimizer_no_decay_pattern", None)
+    if no_decay_pattern:
+        re.compile(no_decay_pattern)
+        config.optimizer.param_groups.insert(
+            0,
+            ParamGroupConfig(
+                pattern=no_decay_pattern,
+                optimizer_name="AdamW",
+                optimizer_kwargs={**config.optimizer.param_groups[0].optimizer_kwargs, "weight_decay": 0.0},
+            ),
+        )
 
     config.lr_scheduler.warmup_steps = args.lr_warmup_iters
     if args.lr_decay_style == "constant":
